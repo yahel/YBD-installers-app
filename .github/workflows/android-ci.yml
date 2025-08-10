@@ -18,19 +18,19 @@ jobs:
 
       - name: Install required SDK packages
         run: |
-          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" "build-tools;34.0.2"
           yes | sdkmanager --licenses
+          sdkmanager --list | head -n 200
 
       - name: Ensure Gradle wrapper exists
         run: test -f gradlew || { echo "Gradle wrapper missing"; exit 1; }
-
       - name: Make Gradle wrapper executable
         run: chmod +x gradlew
 
-      - name: Print Gradle/Java versions
+      - name: Print tool versions
         run: ./gradlew -v
 
-      - name: Build Debug APK (capture stdout+stderr with pipefail)
+      - name: Build Debug APK (capture stdout+stderr)
         shell: bash
         run: |
           set -o pipefail
@@ -56,10 +56,3 @@ jobs:
         with:
           name: build-outputs
           path: app/build/outputs/**
-
-      - name: Upload APK artifact (on success)
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: installerapp-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
