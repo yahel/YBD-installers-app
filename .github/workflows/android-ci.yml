@@ -23,25 +23,39 @@ jobs:
 
       - name: Ensure Gradle wrapper exists
         run: test -f gradlew || { echo "Gradle wrapper missing"; exit 1; }
-      
+
       - name: Make Gradle wrapper executable
         run: chmod +x gradlew
 
       - name: Print Gradle/Java versions
         run: ./gradlew -v
 
-      - name: Build Debug APK (capture logs)
-        run: ./gradlew clean :app:assembleDebug --no-daemon --stacktrace --warning-mode all | tee gradle-build.log
+      - name: Build Debug APK (capture stdout+stderr with pipefail)
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew clean :app:assembleDebug --no-daemon --stacktrace --warning-mode all 2>&1 | tee gradle-build.log
+
+      - name: List build outputs
+        run: |
+          echo "::group::outputs"
+          ls -R app/build/outputs || true
+          echo "::endgroup::"
+          find app -type f \( -name "*debug*.apk" -o -name "*.aab" \) -print || true
 
       - name: Upload build logs (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
-          path: |
-            gradle-build.log
-            **/build/reports/**
-            **/outputs/logs/**
+          path: gradle-build.log
+
+      - name: Upload build outputs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-outputs
+          path: app/build/outputs/**
 
       - name: Upload APK artifact (on success)
         if: success()
