@@ -1,5 +1,4 @@
 package com.celerate.installer.viewmodel
-
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -18,44 +17,22 @@ import okhttp3.OkHttpClient
 import okhttp3.Dns
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import java.util.concurrent.TimeUnit
-
-/**
- * NetworkStatusViewModel
- * ----------------------
- * Drives the four status indicators required for field visibility:
- *  • Controller (internet via cellular)
- *  • Installer-AP (AGLR Wi-Fi presence)
- *  • UBNT-Radio (via AGLR)
- *  • Mikrotik (via AGLR)
- *
- * It owns the orchestrator, periodically probes endpoints, and exposes a
- * `StateFlow<ConnectionStatus>` for each indicator to the UI.
- */
 class NetworkStatusViewModel(app: Application) : AndroidViewModel(app) {
     private val orchestrator = ConnectivityOrchestrator(app)
-
     private val _controller = MutableStateFlow<ConnectionStatus>(ConnectionStatus.Unknown)
     val controller: StateFlow<ConnectionStatus> = _controller.asStateFlow()
-
     private val _aglr = MutableStateFlow<ConnectionStatus>(ConnectionStatus.Unknown)
     val aglr: StateFlow<ConnectionStatus> = _aglr.asStateFlow()
-
     private val _ubnt = MutableStateFlow<ConnectionStatus>(ConnectionStatus.Unknown)
     val ubnt: StateFlow<ConnectionStatus> = _ubnt.asStateFlow()
-
     private val _mkt = MutableStateFlow<ConnectionStatus>(ConnectionStatus.Unknown)
     val mkt: StateFlow<ConnectionStatus> = _mkt.asStateFlow()
-
-    // --- Configuration (can be surfaced as editable settings in the UI) ---
-    var controllerBaseUrl: String = "https://staging.controller.example" // cloud base URL
-    var aglrSsid: String = "AGLR-Installer"                               // Installer-AP SSID
-    var aglrPass: String? = null                                           // WPA2 pass if any
-    var ubntIp: String = "192.168.1.20"                                   // UBNT default
-    var mktIp: String = "192.168.88.1"                                    // Mikrotik default
-
+    var controllerBaseUrl: String = "https://staging.controller.example"
+    var aglrSsid: String = "AGLR-Installer"
+    var aglrPass: String? = null
+    var ubntIp: String = "192.168.1.20"
+    var mktIp: String = "192.168.88.1"
     private var probeJob: Job? = null
-
-    /** Initiate/hold AGLR Wi-Fi session. Safe to call multiple times. */
     fun connectAglr() {
         viewModelScope.launch {
             _aglr.value = ConnectionStatus.Connecting
@@ -64,18 +41,68 @@ class NetworkStatusViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
     }
-
-    /** Request/hold a cellular network (internet). */
     fun requestCellular() {
-        viewModelScope.launch { orchestrator.requestCellular().collect { /* handled via currentHandles() */ } }
+        viewModelScope.launch { orchestrator.requestCellular().collect { } }
     }
-
-    /**
-     * Begin periodic probing of all endpoints. Each tick:
-     *  1) Updates Installer-AP status from `aglrNetwork` presence
-     *  2) Probes Controller over **cellular**
-     *  3) Probes UBNT & Mikrotik via **AGLR** using TCP (SSH/HTTP/RouterOS)
-     */
     fun startProbing(intervalMs: Long = 3000) {
-        if (probeJob
-
+        if (probeJob != null) return
+        requestCellular()
+        if (_aglr.value !is ConnectionStatus.Connected) connectAglr()
+        probeJob = viewModelScope.launch {
+            val cloudClient = OkHttpClient.Builder()
+                .connectTimeout(1500, TimeUnit.MILLISECONDS)
+                .readTimeout(1500, TimeUnit.MILLISECONDS)
+                .build()
+            while (true) {
+                val handles = orchestrator.currentHandles()
+                _aglr.value = if (handles.aglr != null) ConnectionStatus.Connected() else ConnectionStatus.Disconnected("not connected")
+                _controller.value = ConnectionStatus.Connecting
+                val ctlUrl = runCatching { controllerBaseUrl.toHttpUrl() }.getOrNull()
+                if (ctlUrl != null && handles.cellular != null) {
+                    val pinned = cloudClient.newBuilder()
+                        .socketFactory(handles.cellular.socketFactory)
+                        .dns(Dns { hostname -> handles.cellular.getAllByName(hostname).toList() })
+                        .build()
+                    when (val r = probeHttp(ctlUrl, pinned)) {
+                        is ProbeResult.Up -> _controller.value = ConnectionStatus.Connected(r.latencyMs)
+                        is ProbeResult.Down -> _controller.value = ConnectionStatus.Disconnected(r.reason)
+                    }
+                } else {
+                    _controller.value = ConnectionStatus.Disconnected("no cellular or bad URL")
+                }
+                if (handles.aglr != null) {
+                    val r = probeTcp(ubntIp, 22, handles.aglr)
+                    _ubnt.value = when (r) {
+                        is ProbeResult.Up -> ConnectionStatus.Connected(r.latencyMs)
+                        is ProbeResult.Down -> {
+                            val r2 = probeTcp(ubntIp, 80, handles.aglr)
+                            when (r2) {
+                                is ProbeResult.Up -> ConnectionStatus.Connected(r2.latencyMs)
+                                is ProbeResult.Down -> ConnectionStatus.Disconnected(r2.reason)
+                            }
+                        }
+                    }
+                } else {
+                    _ubnt.value = ConnectionStatus.Disconnected("no AGLR")
+                }
+                if (handles.aglr != null) {
+                    val r = probeTcp(mktIp, 22, handles.aglr)
+                    _mkt.value = when (r) {
+                        is ProbeResult.Up -> ConnectionStatus.Connected(r.latencyMs)
+                        is ProbeResult.Down -> {
+                            val r2 = probeTcp(mktIp, 8728, handles.aglr)
+                            when (r2) {
+                                is ProbeResult.Up -> ConnectionStatus.Connected(r2.latencyMs)
+                                is ProbeResult.Down -> ConnectionStatus.Disconnected(r2.reason)
+                            }
+                        }
+                    }
+                } else {
+                    _mkt.value = ConnectionStatus.Disconnected("no AGLR")
+                }
+                kotlinx.coroutines.delay(intervalMs)
+            }
+        }
+    }
+    fun stopProbing() { probeJob?.cancel(); probeJob = null }
+}

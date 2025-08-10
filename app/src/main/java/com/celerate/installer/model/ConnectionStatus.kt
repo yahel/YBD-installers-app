@@ -1,5 +1,4 @@
 package com.celerate.installer.model
-
 sealed interface ConnectionStatus {
     data object Unknown : ConnectionStatus
     data object Connecting : ConnectionStatus
