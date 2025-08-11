@@ -1,0 +1,249 @@
+cd ~/work/YBD-installers-app
+cat > /tmp/canvas.patch <<'PATCH'
+diff --git a/app/src/main/java/com/celerate/installer/orchestrator/ConnectivityOrchestrator.kt b/app/src/main/java/com/celerate/installer/orchestrator/ConnectivityOrchestrator.kt
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/src/main/java/com/celerate/installer/orchestrator/ConnectivityOrchestrator.kt
+@@ -0,0 +1,119 @@
++package com.celerate.installer.orchestrator
++
++import android.net.*
++import android.net.wifi.WifiNetworkSpecifier
++import kotlinx.coroutines.channels.awaitClose
++import kotlinx.coroutines.flow.*
++
++/**
++ * ConnectivityOrchestrator (safe)
++ * -------------------------------
++ * Holds two concurrent network paths:
++ *  • AGLR Wi-Fi (no internet) via WifiNetworkSpecifier (app-scoped)
++ *  • Cellular (internet)
++ *
++ * Guards requestNetwork() with try/catch so missing permissions or OEM quirks
++ * cannot crash the app. Flows emit null on error and close cleanly.
++ */
++class ConnectivityOrchestrator(private val context: android.content.Context) {
++    data class Handles(val aglr: Network?, val cellular: Network?)
++
++    private val cm: ConnectivityManager =
++        context.getSystemService(ConnectivityManager::class.java)
++
++    private var aglrCallback: ConnectivityManager.NetworkCallback? = null
++    private var cellCallback: ConnectivityManager.NetworkCallback? = null
++
++    private val _aglrNetwork = MutableStateFlow<Network?>(null)
++    val aglrNetwork: StateFlow<Network?> = _aglrNetwork.asStateFlow()
++
++    private val _cellNetwork = MutableStateFlow<Network?>(null)
++    val cellNetwork: StateFlow<Network?> = _cellNetwork.asStateFlow()
++
++    fun connectToAglr(ssid: String, passphrase: String?): Flow<Network?> = callbackFlow {
++        val specBuilder = WifiNetworkSpecifier.Builder().setSsid(ssid)
++        if (!passphrase.isNullOrBlank()) specBuilder.setWpa2Passphrase(passphrase)
++        val spec = specBuilder.build()
++        val req = NetworkRequest.Builder()
++            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
++            .setNetworkSpecifier(spec)
++            .build()
++        val cb = object : ConnectivityManager.NetworkCallback() {
++            override fun onAvailable(network: Network) { _aglrNetwork.value = network; trySend(network) }
++            override fun onLost(network: Network) { if (_aglrNetwork.value == network) _aglrNetwork.value = null; trySend(null) }
++        }
++        aglrCallback?.let { runCatching { cm.unregisterNetworkCallback(it) } }
++        aglrCallback = cb
++        try {
++            cm.requestNetwork(req, cb)
++        } catch (e: SecurityException) {
++            trySend(null); close(e); return@callbackFlow
++        } catch (e: IllegalArgumentException) {
++            trySend(null); close(e); return@callbackFlow
++        }
++        awaitClose {
++            runCatching { cm.unregisterNetworkCallback(cb) }
++            if (aglrCallback == cb) aglrCallback = null
++            _aglrNetwork.value = null
++        }
++    }
++
++    fun requestCellular(): Flow<Network?> = callbackFlow {
++        val req = NetworkRequest.Builder()
++            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
++            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
++            .build()
++        val cb = object : ConnectivityManager.NetworkCallback() {
++            override fun onAvailable(network: Network) { _cellNetwork.value = network; trySend(network) }
++            override fun onLost(network: Network) { if (_cellNetwork.value == network) _cellNetwork.value = null; trySend(null) }
++        }
++        cellCallback?.let { runCatching { cm.unregisterNetworkCallback(it) } }
++        cellCallback = cb
++        try {
++            cm.requestNetwork(req, cb)
++        } catch (e: SecurityException) {
++            trySend(null); close(e); return@callbackFlow
++        } catch (e: IllegalArgumentException) {
++            trySend(null); close(e); return@callbackFlow
++        }
++        awaitClose {
++            runCatching { cm.unregisterNetworkCallback(cb) }
++            if (cellCallback == cb) cellCallback = null
++            _cellNetwork.value = null
++        }
++    }
++
++    fun currentHandles(): Handles = Handles(aglr = _aglrNetwork.value, cellular = _cellNetwork.value)
++}
+diff --git a/app/src/main/java/com/celerate/installer/MainActivity.kt b/app/src/main/java/com/celerate/installer/MainActivity.kt
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/app/src/main/java/com/celerate/installer/MainActivity.kt
+@@ -0,0 +1,196 @@
++package com.celerate.installer
++
++import android.Manifest
++import android.content.Context
++import android.content.Intent
++import android.content.pm.PackageManager
++import android.location.LocationManager
++import android.os.Build
++import android.os.Bundle
++import android.provider.Settings
++import androidx.activity.ComponentActivity
++import androidx.activity.compose.setContent
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.layout.*
++import androidx.compose.material3.*
++import androidx.compose.runtime.*
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.unit.dp
++import androidx.core.content.ContextCompat
++import androidx.lifecycle.viewmodel.compose.viewModel
++import com.celerate.installer.ui.StatusPill
++import com.celerate.installer.viewmodel.NetworkStatusViewModel
++
++class MainActivity : ComponentActivity() {
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        setContent { App() }
++    }
++}
++
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++fun App(vm: NetworkStatusViewModel = viewModel()) {
++    val context = LocalContext.current
++    val snackbar = remember { SnackbarHostState() }
++
++    val wifiPerms = remember {
++        if (Build.VERSION.SDK_INT >= 33)
++            arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
++        else
++            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
++    }
++    val permLauncher = rememberLauncherForActivityResult(
++        ActivityResultContracts.RequestMultiplePermissions()
++    ) { res ->
++        val granted = wifiPerms.all { res[it] == true }
++        if (granted) vm.connectAglr() else LaunchedEffect(Unit) { snackbar.showSnackbar("Wi-Fi permission is required") }
++    }
++
++    fun hasAll(perms: Array<String>) =
++        perms.all { ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }
++
++    fun isLocationEnabled(): Boolean = try {
++        (context.getSystemService(Context.LOCATION_SERVICE) as LocationManager).isLocationEnabled
++    } catch (_: Exception) { true }
++
++    MaterialTheme {
++        Scaffold(
++            topBar = { TopAppBar(title = { Text("Connectivity Orchestrator – Demo") }) },
++            snackbarHost = { SnackbarHost(snackbar) }
++        ) { padding ->
++            Column(Modifier.padding(padding).padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
++
++                // ——— Guidance banner ———
++                PermsAndLocationBanner(
++                    permsGranted = hasAll(wifiPerms),
++                    locationOn = isLocationEnabled(),
++                    onGrantPerms = { permLauncher.launch(wifiPerms) },
++                    onOpenLocation = {
++                        runCatching { context.startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)) }
++                    }
++                )
++
++                OutlinedTextField(
++                    value = vm.controllerBaseUrl,
++                    onValueChange = { vm.controllerBaseUrl = it },
++                    label = { Text("Controller Base URL") },
++                    singleLine = true,
++                    modifier = Modifier.fillMaxWidth()
++                )
++                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                    OutlinedTextField(value = vm.aglrSsid, onValueChange = { vm.aglrSsid = it }, label = { Text("AGLR SSID") }, singleLine = true, modifier = Modifier.weight(1f))
++                    OutlinedTextField(value = vm.aglrPass ?: "", onValueChange = { vm.aglrPass = it }, label = { Text("AGLR Pass (opt)") }, singleLine = true, modifier = Modifier.weight(1f))
++                }
++                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                    OutlinedTextField(value = vm.ubntIp, onValueChange = { vm.ubntIp = it }, label = { Text("UBNT IP") }, singleLine = true, modifier = Modifier.weight(1f))
++                    OutlinedTextField(value = vm.mktIp, onValueChange = { vm.mktIp = it }, label = { Text("Mikrotik IP") }, singleLine = true, modifier = Modifier.weight(1f))
++                }
++
++                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
++                    Button(onClick = {
++                        when {
++                            !hasAll(wifiPerms) -> permLauncher.launch(wifiPerms)
++                            !isLocationEnabled() -> LaunchedEffect(Unit) { snackbar.showSnackbar("Turn on Location to connect/scan Wi-Fi") }
++                            else -> vm.connectAglr()
++                        }
++                    }) { Text("Connect AGLR") }
++
++                    Button(onClick = { vm.requestCellular() }) { Text("Request Cellular") }
++                    Button(onClick = { vm.startProbing() }) { Text("Start Probing") }
++                    Button(onClick = { vm.stopProbing() }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Text("Stop") }
++                }
++
++                Divider()
++
++                val ctl by vm.controller.collectAsState()
++                val aglr by vm.aglr.collectAsState()
++                val ubnt by vm.ubnt.collectAsState()
++                val mkt by vm.mkt.collectAsState()
++
++                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
++                    StatusPill("Controller", ctl)
++                    StatusPill("Installer-AP", aglr)
++                    StatusPill("UBNT-Radio", ubnt)
++                    StatusPill("Mikrotik", mkt)
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun PermsAndLocationBanner(
++    permsGranted: Boolean,
++    locationOn: Boolean,
++    onGrantPerms: () -> Unit,
++    onOpenLocation: () -> Unit,
++) {
++    if (permsGranted && locationOn) return
++    ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
++        Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++            val msg = when {
++                !permsGranted && !locationOn -> "Needs Wi-Fi permission and Location ON to connect to AGLR"
++                !permsGranted -> "Wi-Fi permission is required to connect to AGLR"
++                else -> "Turn on Location to allow Wi-Fi scan/connect"
++            }
++            Text(msg, style = MaterialTheme.typography.bodyMedium)
++            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                if (!permsGranted) Button(onClick = onGrantPerms) { Text("Grant Permission") }
++                if (!locationOn) OutlinedButton(onClick = onOpenLocation) { Text("Open Location Settings") }
++            }
++        }
++    }
++}
+PATCH
+

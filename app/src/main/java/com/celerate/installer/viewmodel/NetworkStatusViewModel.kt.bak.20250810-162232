@@ -1,6 +1,4 @@
-
 package com.celerate.installer.viewmodel
-
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -16,32 +14,25 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
+import okhttp3.Dns
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import java.util.concurrent.TimeUnit
-
 class NetworkStatusViewModel(app: Application) : AndroidViewModel(app) {
     private val orchestrator = ConnectivityOrchestrator(app)
-
     private val _controller = MutableStateFlow<ConnectionStatus>(ConnectionStatus.Unknown)
     val controller: StateFlow<ConnectionStatus> = _controller.asStateFlow()
-
     private val _aglr = MutableStateFlow<ConnectionStatus>(ConnectionStatus.Unknown)
     val aglr: StateFlow<ConnectionStatus> = _aglr.asStateFlow()
-
     private val _ubnt = MutableStateFlow<ConnectionStatus>(ConnectionStatus.Unknown)
     val ubnt: StateFlow<ConnectionStatus> = _ubnt.asStateFlow()
-
     private val _mkt = MutableStateFlow<ConnectionStatus>(ConnectionStatus.Unknown)
     val mkt: StateFlow<ConnectionStatus> = _mkt.asStateFlow()
-
     var controllerBaseUrl: String = "https://staging.controller.example"
     var aglrSsid: String = "AGLR-Installer"
     var aglrPass: String? = null
     var ubntIp: String = "192.168.1.20"
     var mktIp: String = "192.168.88.1"
-
     private var probeJob: Job? = null
-
     fun connectAglr() {
         viewModelScope.launch {
             _aglr.value = ConnectionStatus.Connecting
@@ -50,35 +41,27 @@ class NetworkStatusViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
     }
-
     fun requestCellular() {
         viewModelScope.launch { orchestrator.requestCellular().collect { } }
     }
-
     fun startProbing(intervalMs: Long = 3000) {
         if (probeJob != null) return
         requestCellular()
         if (_aglr.value !is ConnectionStatus.Connected) connectAglr()
-
         probeJob = viewModelScope.launch {
             val cloudClient = OkHttpClient.Builder()
                 .connectTimeout(1500, TimeUnit.MILLISECONDS)
                 .readTimeout(1500, TimeUnit.MILLISECONDS)
                 .build()
-
             while (true) {
                 val handles = orchestrator.currentHandles()
-
-                // Installer-AP presence
                 _aglr.value = if (handles.aglr != null) ConnectionStatus.Connected() else ConnectionStatus.Disconnected("not connected")
-
-                // Controller over cellular
                 _controller.value = ConnectionStatus.Connecting
                 val ctlUrl = runCatching { controllerBaseUrl.toHttpUrl() }.getOrNull()
                 if (ctlUrl != null && handles.cellular != null) {
-                    val cellNet = handles.cellular!!
                     val pinned = cloudClient.newBuilder()
-                        .socketFactory(cellNet.socketFactory) // pin sockets to cellular
+                        .socketFactory(handles.cellular.socketFactory)
+                        .dns(Dns { hostname -> handles.cellular.getAllByName(hostname).toList() })
                         .build()
                     when (val r = probeHttp(ctlUrl, pinned)) {
                         is ProbeResult.Up -> _controller.value = ConnectionStatus.Connected(r.latencyMs)
@@ -87,8 +70,6 @@ class NetworkStatusViewModel(app: Application) : AndroidViewModel(app) {
                 } else {
                     _controller.value = ConnectionStatus.Disconnected("no cellular or bad URL")
                 }
-
-                // UBNT via AGLR: SSH 22, fallback HTTP 80
                 if (handles.aglr != null) {
                     val r = probeTcp(ubntIp, 22, handles.aglr)
                     _ubnt.value = when (r) {
@@ -104,8 +85,6 @@ class NetworkStatusViewModel(app: Application) : AndroidViewModel(app) {
                 } else {
                     _ubnt.value = ConnectionStatus.Disconnected("no AGLR")
                 }
-
-                // Mikrotik via AGLR: SSH 22, fallback 8728
                 if (handles.aglr != null) {
                     val r = probeTcp(mktIp, 22, handles.aglr)
                     _mkt.value = when (r) {
@@ -121,11 +100,9 @@ class NetworkStatusViewModel(app: Application) : AndroidViewModel(app) {
                 } else {
                     _mkt.value = ConnectionStatus.Disconnected("no AGLR")
                 }
-
-                delay(intervalMs)
+                kotlinx.coroutines.delay(intervalMs)
             }
         }
     }
-
     fun stopProbing() { probeJob?.cancel(); probeJob = null }
 }

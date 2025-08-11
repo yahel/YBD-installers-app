@@ -1,17 +1,25 @@
 package com.celerate.installer.orchestrator
+
 import android.net.*
 import android.net.wifi.WifiNetworkSpecifier
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.*
+
 class ConnectivityOrchestrator(private val context: android.content.Context) {
     data class Handles(val aglr: Network?, val cellular: Network?)
-    private val cm: ConnectivityManager = context.getSystemService(ConnectivityManager::class.java)
+
+    private val cm: ConnectivityManager =
+        context.getSystemService(ConnectivityManager::class.java)
+
     private var aglrCallback: ConnectivityManager.NetworkCallback? = null
     private var cellCallback: ConnectivityManager.NetworkCallback? = null
+
     private val _aglrNetwork = MutableStateFlow<Network?>(null)
     val aglrNetwork: StateFlow<Network?> = _aglrNetwork.asStateFlow()
+
     private val _cellNetwork = MutableStateFlow<Network?>(null)
     val cellNetwork: StateFlow<Network?> = _cellNetwork.asStateFlow()
+
     fun connectToAglr(ssid: String, passphrase: String?): Flow<Network?> = callbackFlow {
         val specBuilder = WifiNetworkSpecifier.Builder().setSsid(ssid)
         if (!passphrase.isNullOrBlank()) specBuilder.setWpa2Passphrase(passphrase)
@@ -26,13 +34,20 @@ class ConnectivityOrchestrator(private val context: android.content.Context) {
         }
         aglrCallback?.let { runCatching { cm.unregisterNetworkCallback(it) } }
         aglrCallback = cb
-        cm.requestNetwork(req, cb)
+        try {
+            cm.requestNetwork(req, cb)
+        } catch (e: SecurityException) {
+            trySend(null); close(e); return@callbackFlow
+        } catch (e: IllegalArgumentException) {
+            trySend(null); close(e); return@callbackFlow
+        }
         awaitClose {
             runCatching { cm.unregisterNetworkCallback(cb) }
             if (aglrCallback == cb) aglrCallback = null
             _aglrNetwork.value = null
         }
     }
+
     fun requestCellular(): Flow<Network?> = callbackFlow {
         val req = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
@@ -44,12 +59,19 @@ class ConnectivityOrchestrator(private val context: android.content.Context) {
         }
         cellCallback?.let { runCatching { cm.unregisterNetworkCallback(it) } }
         cellCallback = cb
-        cm.requestNetwork(req, cb)
+        try {
+            cm.requestNetwork(req, cb)
+        } catch (e: SecurityException) {
+            trySend(null); close(e); return@callbackFlow
+        } catch (e: IllegalArgumentException) {
+            trySend(null); close(e); return@callbackFlow
+        }
         awaitClose {
             runCatching { cm.unregisterNetworkCallback(cb) }
             if (cellCallback == cb) cellCallback = null
             _cellNetwork.value = null
         }
     }
+
     fun currentHandles(): Handles = Handles(aglr = _aglrNetwork.value, cellular = _cellNetwork.value)
 }
